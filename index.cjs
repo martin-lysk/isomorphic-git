@@ -4078,8 +4078,8 @@ class GitWalkerFs {
         return walker.content(this)
       }
 
-      async oid() {
-        return walker.oid(this)
+      async oid(index) {
+        return walker.oid(this, index)
       }
     };
   }
@@ -4149,46 +4149,52 @@ class GitWalkerFs {
     return entry._content
   }
 
-  async oid(entry) {
-    if (entry._oid === false) {
-      const { fs, gitdir, cache } = this;
-      let oid;
-      // See if we can use the SHA1 hash in the index.
-      await GitIndexManager.acquire({ fs, gitdir, cache }, async function(
-        index
-      ) {
-        const stage = index.entriesMap.get(entry._fullpath);
-        const stats = await entry.stat();
-        if (!stage || compareStats(stats, stage)) {
-          const content = await entry.content();
-          if (content === undefined) {
-            oid = undefined;
-          } else {
-            oid = await shasum(
-              GitObject.wrap({ type: 'blob', object: await entry.content() })
-            );
-            // Update the stats in the index so we will get a "cache hit" next time
-            // 1) if we can (because the oid and mode are the same)
-            // 2) and only if we need to (because other stats differ)
-            if (
-              stage &&
-              oid === stage.oid &&
-              stats.mode === stage.mode &&
-              compareStats(stats, stage)
-            ) {
-              index.insert({
-                filepath: entry._fullpath,
-                stats,
-                oid: oid,
-              });
-            }
-          }
-        } else {
-          // Use the index SHA1 rather than compute it
-          oid = stage.oid;
+  async oidWithIndex(entry, index) {
+    let oid;
+    const stage = index.entriesMap.get(entry._fullpath);
+    const stats = await entry.stat();
+    if (!stage || compareStats(stats, stage)) {
+      const content = await entry.content();
+      if (content === undefined) {
+        oid = undefined;
+      } else {
+        oid = await shasum(
+          GitObject.wrap({ type: 'blob', object: await entry.content() })
+        );
+        // Update the stats in the index so we will get a "cache hit" next time
+        // 1) if we can (because the oid and mode are the same)
+        // 2) and only if we need to (because other stats differ)
+        if (
+          stage &&
+          oid === stage.oid &&
+          stats.mode === stage.mode &&
+          compareStats(stats, stage)
+        ) {
+          index.insert({
+            filepath: entry._fullpath,
+            stats,
+            oid: oid,
+          });
         }
-      });
-      entry._oid = oid;
+      }
+    } else {
+      // Use the index SHA1 rather than compute it
+      oid = stage.oid;
+    }
+    return oid
+  }
+
+  async oid(entry, index) {
+    if (entry._oid === false) {
+      if (index) {
+        entry._oid = this.oidWithIndex(entry, index);
+      } else {
+        const { fs, gitdir, cache } = this;
+        // See if we can use the SHA1 hash in the index.
+        await GitIndexManager.acquire({ fs, gitdir, cache }, async index => {
+          entry._oid = this.oidWithIndex(entry, index);
+        });
+      }
     }
     return entry._oid
   }
@@ -13968,6 +13974,8 @@ async function statusMatrix({
     assertParameter('gitdir', gitdir);
     assertParameter('ref', ref);
 
+    let rootCall = false;
+
     const fs = new FileSystem(_fs);
     return await _walk({
       fs,
@@ -13975,6 +13983,21 @@ async function statusMatrix({
       dir,
       gitdir,
       trees: [TREE({ ref }), WORKDIR(), STAGE()],
+      iterate: async function(walk, children) {
+        if (rootCall) {
+          rootCall = true;
+          let walkedChild;
+          await GitIndexManager.acquire({ fs, gitdir, cache }, async function(
+            index
+          ) {
+            acquiredIndex = index;
+            walkedChild = await Promise.all([...children].map(walk));
+          });
+          return walkedChild
+        } else {
+          return Promise.all([...children].map(walk))
+        }
+      },
       map: async function(filepath, [head, workdir, stage]) {
         // Ignore ignored files, but only if they are not already tracked.
         if (!head && !stage && workdir) {

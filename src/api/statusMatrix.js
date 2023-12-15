@@ -5,6 +5,7 @@ import { STAGE } from '../commands/STAGE.js'
 import { TREE } from '../commands/TREE.js'
 import { WORKDIR } from '../commands/WORKDIR.js'
 import { _walk } from '../commands/walk.js'
+import { GitIndexManager } from '../managers/GitIndexManager.js'
 import { GitIgnoreManager } from '../managers/GitIgnoreManager.js'
 import { FileSystem } from '../models/FileSystem.js'
 import { assertParameter } from '../utils/assertParameter.js'
@@ -167,6 +168,8 @@ export async function statusMatrix({
     assertParameter('gitdir', gitdir)
     assertParameter('ref', ref)
 
+    let rootCall = false
+
     const fs = new FileSystem(_fs)
     return await _walk({
       fs,
@@ -174,6 +177,21 @@ export async function statusMatrix({
       dir,
       gitdir,
       trees: [TREE({ ref }), WORKDIR(), STAGE()],
+      iterate: async function(walk, children) {
+        if (rootCall) {
+          rootCall = true
+          let walkedChild
+          await GitIndexManager.acquire({ fs, gitdir, cache }, async function(
+            index
+          ) {
+            acquiredIndex = index
+            walkedChild = await Promise.all([...children].map(walk))
+          })
+          return walkedChild
+        } else {
+          return Promise.all([...children].map(walk))
+        }
+      },
       map: async function(filepath, [head, workdir, stage]) {
         // Ignore ignored files, but only if they are not already tracked.
         if (!head && !stage && workdir) {
